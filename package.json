@@ -1,0 +1,17 @@
+{
+  "name": "temp-voice-discord-bot",
+  "version": "1.0.0",
+  "description": "A temporary voice channel Discord bot with panel controls for name, limit, region, privacy, trust, invites, and more.",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "deploy": "node src/deploy-commands.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.0",
+    "dotenv": "^16.3.1"
+  }
+}
