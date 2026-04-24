@@ -287,15 +287,7 @@ function makeControlRows(channelId, state) {
     new ButtonBuilder().setCustomId(`${CHANNEL_PREFIX}:delete:${channelId}`).setLabel('Delete').setStyle(ButtonStyle.Danger)
   );
 
-  const row5 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`${CHANNEL_PREFIX}:quick-trust:${channelId}`).setEmoji('👤').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`${CHANNEL_PREFIX}:quick-invite:${channelId}`).setEmoji('📞').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`${CHANNEL_PREFIX}:quick-region:${channelId}`).setEmoji('🌍').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`${CHANNEL_PREFIX}:quick-claim:${channelId}`).setEmoji('👑').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`${CHANNEL_PREFIX}:quick-delete:${channelId}`).setEmoji('🗑️').setStyle(ButtonStyle.Danger)
-  );
-
-  return [row1, row2, row3, row4, row5];
+  return [row1, row2, row3, row4];
 }
 
 function isController(member, state) {
