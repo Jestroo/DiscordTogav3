@@ -10,11 +10,7 @@ if (!token || !clientId || !guildId) {
   process.exit(1);
 }
 
-const commands = [
-  new SlashCommandBuilder()
-    .setName('tempvoice')
-    .setDescription('Create a temporary voice channel with control buttons')
-].map((command) => command.toJSON());
+const commands = [];
 
 const rest = new REST({ version: '10' }).setToken(token);
 

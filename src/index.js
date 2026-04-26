@@ -15,6 +15,7 @@ const {
   ChannelType,
   PermissionFlagsBits,
   PermissionsBitField,
+  MessageFlags,
   Events,
   ComponentType,
   REST,
@@ -37,6 +38,9 @@ const client = new Client({
 });
 
 const voiceStates = new Map();
+const voiceStatesByOwner = new Map();
+const TRUSTED_ACTIONS = new Set(['trust', 'untrust', 'invite', 'kick', 'block', 'unblock', 'transfer', 'quick-trust', 'quick-invite']);
+const DEFAULT_TEXT_COMMANDS = new Set(['name', 'limit', 'region', 'privacy', 'claim', 'delete']);
 
 const CHANNEL_PREFIX = 'tempvoice';
 const LOBBY_CHANNEL_ID = '1497294929477505115';
@@ -48,12 +52,7 @@ async function getLobbyChannel() {
 }
 
 function findExistingTempVoiceForOwner(ownerId) {
-  for (const state of voiceStates.values()) {
-    if (state.ownerId === ownerId) {
-      return state;
-    }
-  }
-  return null;
+  return voiceStatesByOwner.get(ownerId) || null;
 }
 
 function getVerifiedRole(guild) {
@@ -104,17 +103,17 @@ async function createTempVoiceForMember(member, lobbyChannel) {
   const overwrites = [
     {
       id: guild.roles.everyone,
-      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect]
+      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.SendMessages]
     },
     {
       id: member.id,
-      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect]
+      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.SendMessages]
     }
   ];
   if (unverifiedRole) {
     overwrites.push({
       id: unverifiedRole.id,
-      deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect]
+      deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.SendMessages]
     });
   }
 
@@ -137,21 +136,30 @@ async function createTempVoiceForMember(member, lobbyChannel) {
     blocked: new Set(),
     userLimit: 0,
     panelChannelId: null,
-    panelMessageId: null
+    panelMessageId: null,
+    panelChannelUsesVoiceChat: false
   };
 
   voiceStates.set(voiceChannel.id, state);
-  await member.voice.setChannel(voiceChannel);
+  voiceStatesByOwner.set(member.id, state);
 
-  const statusEmbed = buildStatusEmbed(voiceChannel, state);
-  const components = makeControlRows(voiceChannel.id, state);
+  const panelPayload = {
+    content: `Control panel for <@${member.id}>`,
+    embeds: [buildStatusEmbed(voiceChannel, state)],
+    components: makeControlRows(voiceChannel.id, state),
+    allowedMentions: { users: [member.id] }
+  };
 
-  let panelChannel = await guild.channels.create({
-    name: `${channelName}-panel`,
-    type: ChannelType.GuildText,
-    parent: voiceChannel.parentId || undefined,
-    topic: `Control panel for ${voiceChannel.name}`,
-    permissionOverwrites: [
+  let panelChannel = null;
+  let panelMessage = null;
+
+  try {
+    panelMessage = await voiceChannel.send(panelPayload);
+    state.panelChannelId = voiceChannel.id;
+    state.panelMessageId = panelMessage.id;
+    state.panelChannelUsesVoiceChat = true;
+  } catch (error) {
+    const panelOverwrites = [
       {
         id: guild.roles.everyone,
         deny: [PermissionFlagsBits.ViewChannel]
@@ -165,36 +173,23 @@ async function createTempVoiceForMember(member, lobbyChannel) {
         allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
         deny: [PermissionFlagsBits.SendMessages, PermissionFlagsBits.AddReactions]
       }
-    ]
-  });
+    ];
 
-  const panelMessage = await panelChannel.send({ embeds: [statusEmbed], components });
-  state.panelChannelId = panelChannel.id;
-  state.panelMessageId = panelMessage.id;
+    panelChannel = await guild.channels.create({
+      name: `${channelName}-panel`,
+      type: ChannelType.GuildText,
+      parent: lobbyChannel.parentId || undefined,
+      topic: `Control panel for ${member.user.tag}'s temp voice channel`,
+      permissionOverwrites: panelOverwrites
+    });
 
-  const commandsEmbed = new EmbedBuilder()
-    .setTitle(`This is the start of the ${channelName} voice channel`)
-    .setDescription('Use these commands to manage your temp VC:')
-    .addFields(
-      { name: '.v name', value: 'Rename the voice channel', inline: true },
-      { name: '.v limit', value: 'Set max users', inline: true },
-      { name: '.v region', value: 'Change the voice region', inline: true },
-      { name: '.v privacy', value: 'Lock or unlock the channel', inline: true },
-      { name: '.v trust', value: 'Trust a connected user', inline: true },
-      { name: '.v untrust', value: 'Remove trusted access', inline: true },
-      { name: '.v kick', value: 'Reject a connected user', inline: true },
-      { name: '.v unblock', value: 'Allow a rejected user again', inline: true },
-      { name: '.v claim', value: 'Claim ownership', inline: true },
-      { name: '.v transfer', value: 'Transfer ownership', inline: true },
-      { name: '.v delete', value: 'Delete the voice channel', inline: true }
-    )
-    .setColor(0x57f287);
+    panelMessage = await panelChannel.send(panelPayload);
+    state.panelChannelId = panelChannel.id;
+    state.panelMessageId = panelMessage.id;
+    state.panelChannelUsesVoiceChat = false;
+  }
 
-  await panelChannel.send({
-    content: `Welcome <@${member.id}>! Your temp voice channel has been created. Only the owner can rename, set limit, or change the region.`,
-    embeds: [commandsEmbed],
-    allowedMentions: { users: [member.id] }
-  });
+  await member.voice.setChannel(voiceChannel);
 
   return voiceChannel;
 }
@@ -203,16 +198,34 @@ async function cleanupTempVoiceChannel(channelId) {
   const state = voiceStates.get(channelId);
   if (!state) return;
 
-  if (state.panelChannelId) {
-    const panelChannel = await client.channels.fetch(state.panelChannelId).catch(() => null);
-    if (panelChannel?.isTextBased()) {
-      await panelChannel.delete('Temp VC panel deleted').catch(() => null);
+  voiceStates.delete(channelId);
+  if (voiceStatesByOwner.get(state.ownerId) === state) {
+    voiceStatesByOwner.delete(state.ownerId);
+  }
+
+  const voiceChannel = await client.channels.fetch(channelId).catch(() => null);
+  if (voiceChannel) {
+    try {
+      await voiceChannel.delete('Temp voice channel empty');
+    } catch (error) {
+      if (!(error.code === 10003 || error?.rawError?.code === 10003)) {
+        throw error;
+      }
     }
   }
 
-  voiceStates.delete(channelId);
-  const voiceChannel = await client.channels.fetch(channelId).catch(() => null);
-  if (voiceChannel) await voiceChannel.delete('Temp voice channel empty');
+  if (state.panelChannelId && !state.panelChannelUsesVoiceChat) {
+    const panelChannel = await client.channels.fetch(state.panelChannelId).catch(() => null);
+    if (panelChannel) {
+      try {
+        await panelChannel.delete('Temp voice panel removed');
+      } catch (error) {
+        if (!(error.code === 10003 || error?.rawError?.code === 10003)) {
+          throw error;
+        }
+      }
+    }
+  }
 }
 
 function buildStatusEmbed(channel, state) {
@@ -230,7 +243,7 @@ function buildStatusEmbed(channel, state) {
 }
 
 async function syncPanelChannelPermissions(state, oldOwnerId = null) {
-  if (!state.panelChannelId) return;
+  if (!state.panelChannelId || state.panelChannelUsesVoiceChat) return;
   const panelChannel = await client.channels.fetch(state.panelChannelId).catch(() => null);
   if (!panelChannel || !panelChannel.isTextBased()) return;
 
@@ -272,8 +285,11 @@ function makeControlRows(channelId, state) {
   );
 
   const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`${CHANNEL_PREFIX}:claim:${channelId}`).setLabel('Claim').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`${CHANNEL_PREFIX}:trust:${channelId}`).setLabel('Trust').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`${CHANNEL_PREFIX}:untrust:${channelId}`).setLabel('Untrust').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId(`${CHANNEL_PREFIX}:untrust:${channelId}`).setLabel('Untrust').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`${CHANNEL_PREFIX}:transfer:${channelId}`).setLabel('Transfer').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`${CHANNEL_PREFIX}:delete:${channelId}`).setLabel('Delete').setStyle(ButtonStyle.Danger)
   );
 
   const row3 = new ActionRowBuilder().addComponents(
@@ -281,13 +297,7 @@ function makeControlRows(channelId, state) {
     new ButtonBuilder().setCustomId(`${CHANNEL_PREFIX}:unblock:${channelId}`).setLabel('Unblock').setStyle(ButtonStyle.Secondary)
   );
 
-  const row4 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`${CHANNEL_PREFIX}:claim:${channelId}`).setLabel('Claim').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId(`${CHANNEL_PREFIX}:transfer:${channelId}`).setLabel('Transfer').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`${CHANNEL_PREFIX}:delete:${channelId}`).setLabel('Delete').setStyle(ButtonStyle.Danger)
-  );
-
-  return [row1, row2, row3, row4];
+  return [row1, row2, row3];
 }
 
 function isController(member, state) {
@@ -296,15 +306,14 @@ function isController(member, state) {
 
 function canPerformAction(member, state, action) {
   if (member.id === state.ownerId) return true;
-  const trustedActions = new Set(['trust', 'untrust', 'invite', 'kick', 'block', 'unblock', 'quick-trust', 'quick-invite']);
-  return trustedActions.has(action) && state.trusted.has(member.id);
+  return TRUSTED_ACTIONS.has(action) && state.trusted.has(member.id);
 }
 
 async function updatePanelMessage(client, state, text) {
   if (!state.panelChannelId || !state.panelMessageId) return;
   try {
     const channel = await client.channels.fetch(state.panelChannelId);
-    if (!channel || !channel.isTextBased()) return;
+    if (!channel) return;
     const message = await channel.messages.fetch(state.panelMessageId);
     if (!message) return;
     await message.edit({
@@ -399,69 +408,28 @@ async function loadVoiceState(channel) {
 
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
-    if (interaction.isChatInputCommand()) {
-      if (interaction.commandName !== 'tempvoice') return;
-      const ownerId = interaction.user.id;
-      const guild = interaction.guild;
-      const categoryId = interaction.channel?.parentId || null;
-      const voiceChannel = await guild.channels.create({
-        name: `${interaction.user.username}'s temp`,
-        type: ChannelType.GuildVoice,
-        parent: categoryId,
-        permissionOverwrites: [
-          {
-            id: guild.roles.everyone,
-            allow: [PermissionFlagsBits.Connect]
-          }
-        ]
-      });
-
-      const state = {
-        channelId: voiceChannel.id,
-        ownerId,
-        private: false,
-        waitingRoom: false,
-        chatEnabled: false,
-        textChannelId: null,
-        trusted: new Set(),
-        blocked: new Set(),
-        userLimit: 0,
-        panelChannelId: interaction.channel.id,
-        panelMessageId: null
-      };
-      voiceStates.set(voiceChannel.id, state);
-
-      const panel = await interaction.reply({
-        embeds: [buildStatusEmbed(voiceChannel, state)],
-        components: makeControlRows(voiceChannel.id, state),
-        fetchReply: true
-      });
-      state.panelMessageId = panel.id;
-      return;
-    }
-
     if (interaction.isButton()) {
       if (interaction.customId === VERIFY_BUTTON_ID) {
         const guild = interaction.guild;
         if (!guild) {
-          await interaction.reply({ content: 'This button can only be used in the server.', ephemeral: true });
+          await interaction.reply({ content: 'This button can only be used in the server.', flags: MessageFlags.Ephemeral });
           return;
         }
 
         const role = getVerifiedRole(guild);
         if (!role) {
-          await interaction.reply({ content: 'Verified role is not configured on this server.', ephemeral: true });
+          await interaction.reply({ content: 'Verified role is not configured on this server.', flags: MessageFlags.Ephemeral });
           return;
         }
 
         const member = interaction.member || await guild.members.fetch(interaction.user.id).catch(() => null);
         if (!member) {
-          await interaction.reply({ content: 'Could not resolve your member information.', ephemeral: true });
+          await interaction.reply({ content: 'Could not resolve your member information.', flags: MessageFlags.Ephemeral });
           return;
         }
 
         if (member.roles.cache.has(role.id)) {
-          await interaction.reply({ content: 'You are already verified.', ephemeral: true });
+          await interaction.reply({ content: 'You are already verified.', flags: MessageFlags.Ephemeral });
           return;
         }
 
@@ -471,7 +439,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           await member.roles.remove(unverifiedRole, 'Removed unverified role after verification');
         }
 
-        await interaction.reply({ content: `You have been given the **${role.name}** role.`, ephemeral: true });
+        await interaction.reply({ content: `You have been given the **${role.name}** role.`, flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -480,25 +448,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const state = voiceStates.get(channelId);
       if (!state) {
-        await interaction.reply({ content: 'This temp voice channel is no longer available.', ephemeral: true });
+        await interaction.reply({ content: 'This temp voice channel is no longer available.', flags: MessageFlags.Ephemeral });
         return;
       }
 
       const voiceChannel = await client.channels.fetch(channelId);
       if (!voiceChannel || voiceChannel.type !== ChannelType.GuildVoice) {
         voiceStates.delete(channelId);
-        await interaction.reply({ content: 'Channel was deleted or is unavailable.', ephemeral: true });
+        await interaction.reply({ content: 'Channel was deleted or is unavailable.', flags: MessageFlags.Ephemeral });
         return;
       }
 
       const guild = voiceChannel.guild;
       if (!guild) {
-        await interaction.reply({ content: 'Could not determine the guild for this channel.', ephemeral: true });
+        await interaction.reply({ content: 'Could not determine the guild for this channel.', flags: MessageFlags.Ephemeral });
         return;
       }
       const member = await guild.members.fetch(interaction.user.id).catch(() => null);
       if (!member || (!canPerformAction(member, state, action) && action !== 'claim' && action !== 'quick-claim')) {
-        await interaction.reply({ content: 'Only the owner or trusted members can use this action.', ephemeral: true });
+        await interaction.reply({ content: 'Only the owner or trusted members can use this action.', flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -538,7 +506,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           await interaction.reply({
             content: 'Select a voice region for the channel.',
             components: [buildRegionSelect(channelId)],
-            ephemeral: true
+            flags: MessageFlags.Ephemeral
           });
           return;
         }
@@ -556,19 +524,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
             });
           }
           await updatePanelMessage(client, state, 'Lock status updated.');
-          await interaction.reply({ content: `Channel is now **${state.private ? 'Locked' : 'Unlocked'}**.`, ephemeral: true });
+          await interaction.reply({ content: `Channel is now **${state.private ? 'Locked' : 'Unlocked'}**.`, flags: MessageFlags.Ephemeral });
           return;
         }
 
         case 'waiting': {
           state.waitingRoom = !state.waitingRoom;
           await updatePanelMessage(client, state, 'Waiting room toggled.');
-          await interaction.reply({ content: `Waiting room is now **${state.waitingRoom ? 'enabled' : 'disabled'}**.`, ephemeral: true });
+          await interaction.reply({ content: `Waiting room is now **${state.waitingRoom ? 'enabled' : 'disabled'}**.`, flags: MessageFlags.Ephemeral });
           return;
         }
 
         case 'chat': {
-          await interaction.reply({ content: 'Text chat is disabled for this mode; only the temporary voice channel is created.', ephemeral: true });
+          await interaction.reply({ content: 'Text chat is disabled for this mode; only the temporary voice channel is created.', flags: MessageFlags.Ephemeral });
           return;
         }
 
@@ -598,13 +566,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
           if (connectedSelectActions.has(action)) {
             const selectRow = buildConnectedVoiceMemberSelect(action, channelId, placeholderMap[action], voiceChannel);
             if (!selectRow) {
-              await interaction.reply({ content: 'No connected users are available for this action.', ephemeral: true });
+              await interaction.reply({ content: 'No connected users are available for this action.', flags: MessageFlags.Ephemeral });
               return;
             }
             await interaction.reply({
               content: 'Choose a connected member to continue.',
               components: [selectRow],
-              ephemeral: true
+              flags: MessageFlags.Ephemeral
             });
             return;
           }
@@ -612,13 +580,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
           if (action === 'unblock') {
             const selectRow = buildBlockedUserSelect(action, channelId, placeholderMap[action], state, voiceChannel.guild);
             if (!selectRow) {
-              await interaction.reply({ content: 'No rejected users are available to unblock.', ephemeral: true });
+              await interaction.reply({ content: 'No rejected users are available to unblock.', flags: MessageFlags.Ephemeral });
               return;
             }
             await interaction.reply({
               content: 'Choose a rejected user to unblock.',
               components: [selectRow],
-              ephemeral: true
+              flags: MessageFlags.Ephemeral
             });
             return;
           }
@@ -626,7 +594,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           await interaction.reply({
             content: 'Choose a user to continue.',
             components: [buildUserSelect(action, channelId, placeholderMap[action])],
-            ephemeral: true
+            flags: MessageFlags.Ephemeral
           });
           return;
         }
@@ -635,13 +603,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case 'quick-claim': {
           const ownersInChannel = voiceChannel.members.has(state.ownerId);
           if (ownersInChannel) {
-            await interaction.reply({ content: 'The owner is still present in the channel; claim is only needed when they leave.', ephemeral: true });
+            await interaction.reply({ content: 'The owner is still present in the channel; claim is only needed when they leave.', flags: MessageFlags.Ephemeral });
             return;
           }
           const previousOwner = state.ownerId;
           state.ownerId = interaction.user.id;
+          if (voiceStatesByOwner.get(previousOwner) === state) {
+            voiceStatesByOwner.delete(previousOwner);
+          }
+          voiceStatesByOwner.set(state.ownerId, state);
           const panelChannel = await client.channels.fetch(state.panelChannelId).catch(() => null);
-          if (panelChannel?.isTextBased()) {
+          if (panelChannel) {
             await panelChannel.permissionOverwrites.edit(interaction.user.id, {
               ViewChannel: true,
               ReadMessageHistory: true,
@@ -653,24 +625,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
             }
           }
           await updatePanelMessage(client, state, 'Ownership claimed.');
-          await interaction.reply({ content: 'You are now the owner of this temp voice channel.', ephemeral: true });
+          await interaction.reply({ content: 'You are now the owner of this temp voice channel.', flags: MessageFlags.Ephemeral });
           return;
         }
 
         case 'delete':
         case 'quick-delete': {
-          await interaction.reply({ content: 'Deleting the voice channel and cleaning up state...', ephemeral: true });
-          if (state.panelChannelId) {
-            const panelChannel = await client.channels.fetch(state.panelChannelId).catch(() => null);
-            if (panelChannel?.isTextBased()) await panelChannel.delete('Temp VC panel deleted');
-          }
+          await interaction.reply({ content: 'Deleting the voice channel and cleaning up state...', flags: MessageFlags.Ephemeral });
           await voiceChannel.delete('Temp voice channel deleted');
           voiceStates.delete(channelId);
           return;
         }
 
         default: {
-          await interaction.reply({ content: 'Unknown action.', ephemeral: true });
+          await interaction.reply({ content: 'Unknown action.', flags: MessageFlags.Ephemeral });
           return;
         }
       }
@@ -681,13 +649,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (prefix !== CHANNEL_PREFIX) return;
       const state = voiceStates.get(channelId);
       if (!state) {
-        await interaction.reply({ content: 'This temp voice channel is no longer available.', ephemeral: true });
+        await interaction.reply({ content: 'This temp voice channel is no longer available.', flags: MessageFlags.Ephemeral });
         return;
       }
 
       const voiceChannel = await client.channels.fetch(channelId);
       if (!voiceChannel) {
-        await interaction.reply({ content: 'Channel is no longer available.', ephemeral: true });
+        await interaction.reply({ content: 'Channel is no longer available.', flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -695,14 +663,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const selected = interaction.values[0];
         const region = selected === 'automatic' ? null : selected;
         await voiceChannel.edit({ rtcRegion: region });
-        await interaction.reply({ content: `Voice region set to **${region || 'Automatic'}**.`, ephemeral: true });
+        await interaction.reply({ content: `Voice region set to **${region || 'Automatic'}**.`, flags: MessageFlags.Ephemeral });
         return;
       }
 
       const targetId = interaction.values[0];
       const targetMember = await voiceChannel.guild.members.fetch(targetId).catch(() => null);
       if (!targetMember) {
-        await interaction.reply({ content: 'Could not find that user in the server.', ephemeral: true });
+        await interaction.reply({ content: 'Could not find that user in the server.', flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -710,21 +678,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case 'kick': {
           const memberVoiceState = targetMember.voice;
           if (memberVoiceState.channelId !== channelId) {
-            await interaction.reply({ content: 'That user is no longer connected to this voice channel.', ephemeral: true });
+            await interaction.reply({ content: 'That user is no longer connected to this voice channel.', flags: MessageFlags.Ephemeral });
             return;
           }
           await memberVoiceState.disconnect('Rejected from temp voice channel');
           state.blocked.add(targetId);
           await voiceChannel.permissionOverwrites.edit(targetId, { Connect: false });
           await updatePanelMessage(client, state, 'User rejected.');
-          await interaction.reply({ content: `<@${targetId}> has been rejected and cannot rejoin this channel until unblocked.`, ephemeral: true });
+          await interaction.reply({ content: `<@${targetId}> has been rejected and cannot rejoin this channel until unblocked.`, flags: MessageFlags.Ephemeral });
           return;
         }
         case 'trust': {
           state.trusted.add(targetId);
           await voiceChannel.permissionOverwrites.edit(targetId, { Connect: true });
           const trustPanelChannel = await client.channels.fetch(state.panelChannelId).catch(() => null);
-          if (trustPanelChannel?.isTextBased()) {
+          if (trustPanelChannel) {
             await trustPanelChannel.permissionOverwrites.edit(targetId, {
               ViewChannel: true,
               ReadMessageHistory: true,
@@ -733,32 +701,36 @@ client.on(Events.InteractionCreate, async (interaction) => {
             });
           }
           await updatePanelMessage(client, state, 'Trusted user added.');
-          await interaction.reply({ content: `<@${targetId}> is now trusted.`, ephemeral: true });
+          await interaction.reply({ content: `<@${targetId}> is now trusted.`, flags: MessageFlags.Ephemeral });
           return;
         }
         case 'untrust': {
           state.trusted.delete(targetId);
           await voiceChannel.permissionOverwrites.edit(targetId, {});
           const untrustPanelChannel = await client.channels.fetch(state.panelChannelId).catch(() => null);
-          if (untrustPanelChannel?.isTextBased()) {
+          if (untrustPanelChannel) {
             await untrustPanelChannel.permissionOverwrites.delete(targetId).catch(() => null);
           }
           await updatePanelMessage(client, state, 'Trusted user removed.');
-          await interaction.reply({ content: `<@${targetId}> is no longer trusted.`, ephemeral: true });
+          await interaction.reply({ content: `<@${targetId}> is no longer trusted.`, flags: MessageFlags.Ephemeral });
           return;
         }
         case 'block': {
           state.blocked.add(targetId);
           await voiceChannel.permissionOverwrites.edit(targetId, { Connect: false });
           await updatePanelMessage(client, state, 'User blocked.');
-          await interaction.reply({ content: `<@${targetId}> is blocked from joining.`, ephemeral: true });
+          await interaction.reply({ content: `<@${targetId}> is blocked from joining.`, flags: MessageFlags.Ephemeral });
           return;
         }
         case 'transfer': {
           const previousOwner = state.ownerId;
           state.ownerId = targetId;
+          if (voiceStatesByOwner.get(previousOwner) === state) {
+            voiceStatesByOwner.delete(previousOwner);
+          }
+          voiceStatesByOwner.set(state.ownerId, state);
           const transferPanelChannel = await client.channels.fetch(state.panelChannelId).catch(() => null);
-          if (transferPanelChannel?.isTextBased()) {
+          if (transferPanelChannel) {
             await transferPanelChannel.permissionOverwrites.edit(targetId, {
               ViewChannel: true,
               ReadMessageHistory: true,
@@ -770,14 +742,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
             }
           }
           await updatePanelMessage(client, state, 'Ownership transferred.');
-          await interaction.reply({ content: `<@${targetId}> is now the owner.`, ephemeral: true });
+          await interaction.reply({ content: `<@${targetId}> is now the owner.`, flags: MessageFlags.Ephemeral });
           return;
         }
         case 'quick-trust': {
           state.trusted.add(targetId);
           await voiceChannel.permissionOverwrites.edit(targetId, { Connect: true });
           const quickTrustPanelChannel = await client.channels.fetch(state.panelChannelId).catch(() => null);
-          if (quickTrustPanelChannel?.isTextBased()) {
+          if (quickTrustPanelChannel) {
             await quickTrustPanelChannel.permissionOverwrites.edit(targetId, {
               ViewChannel: true,
               ReadMessageHistory: true,
@@ -786,11 +758,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
             });
           }
           await updatePanelMessage(client, state, 'Trusted user added.');
-          await interaction.reply({ content: `<@${targetId}> trusted via quick action.`, ephemeral: true });
+          await interaction.reply({ content: `<@${targetId}> trusted via quick action.`, flags: MessageFlags.Ephemeral });
           return;
         }
         default: {
-          await interaction.reply({ content: 'Unknown action.', ephemeral: true });
+          await interaction.reply({ content: 'Unknown action.', flags: MessageFlags.Ephemeral });
           return;
         }
       }
@@ -802,22 +774,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const targetId = interaction.values[0];
       const state = voiceStates.get(channelId);
       if (!state) {
-        await interaction.reply({ content: 'This temp voice channel is no longer available.', ephemeral: true });
+        await interaction.reply({ content: 'This temp voice channel is no longer available.', flags: MessageFlags.Ephemeral });
         return;
       }
       const voiceChannel = await client.channels.fetch(channelId);
       if (!voiceChannel) {
-        await interaction.reply({ content: 'Channel is no longer available.', ephemeral: true });
+        await interaction.reply({ content: 'Channel is no longer available.', flags: MessageFlags.Ephemeral });
         return;
       }
       const guild = voiceChannel.guild;
       if (!guild) {
-        await interaction.reply({ content: 'Could not determine the guild for this channel.', ephemeral: true });
+        await interaction.reply({ content: 'Could not determine the guild for this channel.', flags: MessageFlags.Ephemeral });
         return;
       }
       const targetMember = await guild.members.fetch(targetId).catch(() => null);
       if (!targetMember) {
-        await interaction.reply({ content: 'Could not find that user in the server.', ephemeral: true });
+        await interaction.reply({ content: 'Could not find that user in the server.', flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -826,7 +798,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           state.trusted.add(targetId);
           await voiceChannel.permissionOverwrites.edit(targetId, { Connect: true });
           const panelChannel = await client.channels.fetch(state.panelChannelId).catch(() => null);
-          if (panelChannel?.isTextBased()) {
+          if (panelChannel) {
             await panelChannel.permissionOverwrites.edit(targetId, {
               ViewChannel: true,
               ReadMessageHistory: true,
@@ -835,57 +807,61 @@ client.on(Events.InteractionCreate, async (interaction) => {
             });
           }
           await updatePanelMessage(client, state, 'Trusted user added.');
-          await interaction.reply({ content: `<@${targetId}> is now trusted.`, ephemeral: true });
+          await interaction.reply({ content: `<@${targetId}> is now trusted.`, flags: MessageFlags.Ephemeral });
           return;
         }
         case 'untrust': {
           state.trusted.delete(targetId);
           await voiceChannel.permissionOverwrites.edit(targetId, {});
           const panelChannel = await client.channels.fetch(state.panelChannelId).catch(() => null);
-          if (panelChannel?.isTextBased()) {
+          if (panelChannel) {
             await panelChannel.permissionOverwrites.delete(targetId).catch(() => null);
           }
           await updatePanelMessage(client, state, 'Trusted user removed.');
-          await interaction.reply({ content: `<@${targetId}> is no longer trusted.`, ephemeral: true });
+          await interaction.reply({ content: `<@${targetId}> is no longer trusted.`, flags: MessageFlags.Ephemeral });
           return;
         }
         case 'invite': {
           await voiceChannel.permissionOverwrites.edit(targetId, { Connect: true });
-          await interaction.reply({ content: `<@${targetId}> can now join the channel.`, ephemeral: true });
+          await interaction.reply({ content: `<@${targetId}> can now join the channel.`, flags: MessageFlags.Ephemeral });
           return;
         }
         case 'kick': {
           const memberVoiceState = targetMember.voice;
           if (memberVoiceState.channelId !== channelId) {
-            await interaction.reply({ content: 'That user is not currently in this voice channel.', ephemeral: true });
+            await interaction.reply({ content: 'That user is not currently in this voice channel.', flags: MessageFlags.Ephemeral });
             return;
           }
           await memberVoiceState.disconnect('Rejected from temp voice channel');
           state.blocked.add(targetId);
           await voiceChannel.permissionOverwrites.edit(targetId, { Connect: false });
           await updatePanelMessage(client, state, 'User rejected.');
-          await interaction.reply({ content: `<@${targetId}> has been rejected and cannot rejoin this channel until unblocked.`, ephemeral: true });
+          await interaction.reply({ content: `<@${targetId}> has been rejected and cannot rejoin this channel until unblocked.`, flags: MessageFlags.Ephemeral });
           return;
         }
         case 'block': {
           state.blocked.add(targetId);
           await voiceChannel.permissionOverwrites.edit(targetId, { Connect: false });
           await updatePanelMessage(client, state, 'User blocked.');
-          await interaction.reply({ content: `<@${targetId}> is blocked from joining.`, ephemeral: true });
+          await interaction.reply({ content: `<@${targetId}> is blocked from joining.`, flags: MessageFlags.Ephemeral });
           return;
         }
         case 'unblock': {
           state.blocked.delete(targetId);
           await voiceChannel.permissionOverwrites.edit(targetId, {});
           await updatePanelMessage(client, state, 'User unblocked.');
-          await interaction.reply({ content: `<@${targetId}> may now join again.`, ephemeral: true });
+          await interaction.reply({ content: `<@${targetId}> may now join again.`, flags: MessageFlags.Ephemeral });
           return;
         }
         case 'transfer': {
           const previousOwner = state.ownerId;
           state.ownerId = targetId;
+          if (voiceStatesByOwner.get(previousOwner) === state) {
+            voiceStatesByOwner.delete(previousOwner);
+          }
+          voiceStatesByOwner.set(state.ownerId, state);
           const panelChannel = await client.channels.fetch(state.panelChannelId).catch(() => null);
-          if (panelChannel?.isTextBased()) {
+          if (panelChannel) {
             await panelChannel.permissionOverwrites.edit(targetId, {
               ViewChannel: true,
               ReadMessageHistory: true,
@@ -897,23 +873,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
             }
           }
           await updatePanelMessage(client, state, 'Ownership transferred.');
-          await interaction.reply({ content: `<@${targetId}> is now the owner.`, ephemeral: true });
+          await interaction.reply({ content: `<@${targetId}> is now the owner.`, flags: MessageFlags.Ephemeral });
           return;
         }
         case 'quick-trust': {
           state.trusted.add(targetId);
           await voiceChannel.permissionOverwrites.edit(targetId, { Connect: true });
           await updatePanelMessage(client, state, 'Trusted user added.');
-          await interaction.reply({ content: `<@${targetId}> trusted via quick action.`, ephemeral: true });
+          await interaction.reply({ content: `<@${targetId}> trusted via quick action.`, flags: MessageFlags.Ephemeral });
           return;
         }
         case 'quick-invite': {
           await voiceChannel.permissionOverwrites.edit(targetId, { Connect: true });
-          await interaction.reply({ content: `<@${targetId}> invited via quick action.`, ephemeral: true });
+          await interaction.reply({ content: `<@${targetId}> invited via quick action.`, flags: MessageFlags.Ephemeral });
           return;
         }
         default: {
-          await interaction.reply({ content: 'Unknown select action.', ephemeral: true });
+          await interaction.reply({ content: 'Unknown select action.', flags: MessageFlags.Ephemeral });
           return;
         }
       }
@@ -924,12 +900,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (prefix !== CHANNEL_PREFIX) return;
       const state = voiceStates.get(channelId);
       if (!state) {
-        await interaction.reply({ content: 'This temp voice channel is no longer available.', ephemeral: true });
+        await interaction.reply({ content: 'This temp voice channel is no longer available.', flags: MessageFlags.Ephemeral });
         return;
       }
       const voiceChannel = await client.channels.fetch(channelId);
       if (!voiceChannel) {
-        await interaction.reply({ content: 'Channel is no longer available.', ephemeral: true });
+        await interaction.reply({ content: 'Channel is no longer available.', flags: MessageFlags.Ephemeral });
         return;
       }
       switch (modal) {
@@ -937,7 +913,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           const newName = interaction.fields.getTextInputValue('channelName').slice(0, 100);
           await voiceChannel.setName(newName, 'Temp voice channel renamed');
           await updatePanelMessage(client, state, 'Channel renamed.');
-          await interaction.reply({ content: `Channel renamed to **${newName}**.`, ephemeral: true });
+          await interaction.reply({ content: `Channel renamed to **${newName}**.`, flags: MessageFlags.Ephemeral });
           return;
         }
         case 'modal-limit': {
@@ -946,11 +922,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
           state.userLimit = limit;
           await voiceChannel.edit({ userLimit: limit }, 'Temp voice channel user limit updated');
           await updatePanelMessage(client, state, 'User limit updated.');
-          await interaction.reply({ content: `User limit set to **${limit === 0 ? 'unlimited' : limit}**.`, ephemeral: true });
+          await interaction.reply({ content: `User limit set to **${limit === 0 ? 'unlimited' : limit}**.`, flags: MessageFlags.Ephemeral });
           return;
         }
         default: {
-          await interaction.reply({ content: 'Unknown modal submission.', ephemeral: true });
+          await interaction.reply({ content: 'Unknown modal submission.', flags: MessageFlags.Ephemeral });
           return;
         }
       }
@@ -958,10 +934,209 @@ client.on(Events.InteractionCreate, async (interaction) => {
   } catch (error) {
     console.error('Interaction handler error:', error);
     if (interaction.replied || interaction.deferred) {
-      await interaction.followUp({ content: 'An error occurred while processing your request.', ephemeral: true });
+      await interaction.followUp({ content: 'An error occurred while processing your request.', flags: MessageFlags.Ephemeral });
     } else {
-      await interaction.reply({ content: 'An error occurred while processing your request.', ephemeral: true });
+      await interaction.reply({ content: 'An error occurred while processing your request.', flags: MessageFlags.Ephemeral });
     }
+  }
+});
+
+client.on(Events.MessageCreate, async (message) => {
+  if (message.author.bot || !message.guild) return;
+  if (!message.content.toLowerCase().startsWith('.v')) return;
+
+  const member = await message.guild.members.fetch(message.author.id).catch(() => null);
+  if (!member) return;
+  const voiceChannel = member.voice.channel;
+  if (!voiceChannel) {
+    await message.reply({ content: 'You must be in a temp voice channel to use .v commands.', allowedMentions: { repliedUser: false } });
+    return;
+  }
+
+  const state = voiceStates.get(voiceChannel.id);
+  if (!state) return;
+
+  const args = message.content.trim().split(/\s+/).slice(1);
+  const action = args.shift()?.toLowerCase();
+  if (!action) {
+    await message.reply({ content: 'Usage: `.v <command> [args]`', allowedMentions: { repliedUser: false } });
+    return;
+  }
+
+  const isOwner = member.id === state.ownerId;
+  const canDo = isOwner || (state.trusted.has(member.id) && TRUSTED_ACTIONS.has(action));
+  if (!canDo && !DEFAULT_TEXT_COMMANDS.has(action)) {
+    await message.reply({ content: 'You do not have permission to use that command.', allowedMentions: { repliedUser: false } });
+    return;
+  }
+
+  const getTargetId = (value) => {
+    if (!value) return null;
+    const clean = value.replace(/[<@!>]/g, '');
+    return clean.match(/^\d+$/)?.[0] || null;
+  };
+
+  try {
+    switch (action) {
+      case 'name': {
+        if (!isOwner) {
+          await message.reply({ content: 'Only the owner can rename the channel.', allowedMentions: { repliedUser: false } });
+          return;
+        }
+        const newName = args.join(' ').slice(0, 100).trim();
+        if (!newName) {
+          await message.reply({ content: 'Usage: `.v name <new name>`', allowedMentions: { repliedUser: false } });
+          return;
+        }
+        await voiceChannel.setName(newName, 'Temp voice rename');
+        await message.reply({ content: `Channel renamed to **${newName}**.`, allowedMentions: { repliedUser: false } });
+        return;
+      }
+      case 'limit': {
+        if (!isOwner) {
+          await message.reply({ content: 'Only the owner can change the limit.', allowedMentions: { repliedUser: false } });
+          return;
+        }
+        const limit = parseInt(args[0], 10);
+        if (!Number.isInteger(limit) || limit < 0 || limit > 99) {
+          await message.reply({ content: 'Usage: `.v limit <0-99>` (0 = unlimited)', allowedMentions: { repliedUser: false } });
+          return;
+        }
+        state.userLimit = limit;
+        await voiceChannel.edit({ userLimit: limit }, 'Temp voice user limit updated');
+        await message.reply({ content: `User limit set to **${limit === 0 ? 'unlimited' : limit}**.`, allowedMentions: { repliedUser: false } });
+        return;
+      }
+      case 'region': {
+        if (!isOwner) {
+          await message.reply({ content: 'Only the owner can change the region.', allowedMentions: { repliedUser: false } });
+          return;
+        }
+        const region = args[0]?.toLowerCase() || 'automatic';
+        const allowed = new Set(['automatic', 'us-east', 'us-west', 'brazil', 'europe', 'hongkong', 'india', 'japan', 'singapore']);
+        if (!allowed.has(region)) {
+          await message.reply({ content: 'Usage: `.v region <automatic|us-east|us-west|brazil|europe|hongkong|india|japan|singapore>`', allowedMentions: { repliedUser: false } });
+          return;
+        }
+        await voiceChannel.edit({ rtcRegion: region === 'automatic' ? null : region });
+        await message.reply({ content: `Voice region set to **${region === 'automatic' ? 'Automatic' : region}**.`, allowedMentions: { repliedUser: false } });
+        return;
+      }
+      case 'privacy': {
+        if (!isOwner) {
+          await message.reply({ content: 'Only the owner can toggle privacy.', allowedMentions: { repliedUser: false } });
+          return;
+        }
+        state.private = !state.private;
+        const unverifiedRole = getUnverifiedRole(message.guild);
+        await voiceChannel.permissionOverwrites.edit(message.guild.roles.everyone, {
+          Connect: !state.private
+        });
+        if (unverifiedRole) {
+          await voiceChannel.permissionOverwrites.edit(unverifiedRole.id, {
+            Connect: false,
+            ViewChannel: false
+          });
+        }
+        await message.reply({ content: `Channel is now **${state.private ? 'Locked' : 'Unlocked'}**.`, allowedMentions: { repliedUser: false } });
+        return;
+      }
+      case 'trust':
+      case 'untrust':
+      case 'kick':
+      case 'block':
+      case 'unblock':
+      case 'transfer': {
+        const targetId = getTargetId(args[0]);
+        if (!targetId) {
+          await message.reply({ content: `Usage: \.v ${action} <@user>`, allowedMentions: { repliedUser: false } });
+          return;
+        }
+        const targetMember = await message.guild.members.fetch(targetId).catch(() => null);
+        if (!targetMember) {
+          await message.reply({ content: 'User not found in this server.', allowedMentions: { repliedUser: false } });
+          return;
+        }
+        const memberVoiceState = targetMember.voice;
+        if (['kick', 'block'].includes(action) && memberVoiceState.channelId !== voiceChannel.id) {
+          await message.reply({ content: 'That user is not currently in this voice channel.', allowedMentions: { repliedUser: false } });
+          return;
+        }
+
+        switch (action) {
+          case 'trust':
+            state.trusted.add(targetId);
+            await voiceChannel.permissionOverwrites.edit(targetId, { Connect: true });
+            await message.reply({ content: `<@${targetId}> is now trusted.`, allowedMentions: { repliedUser: false } });
+            return;
+          case 'untrust':
+            state.trusted.delete(targetId);
+            await voiceChannel.permissionOverwrites.edit(targetId, {});
+            await message.reply({ content: `<@${targetId}> is no longer trusted.`, allowedMentions: { repliedUser: false } });
+            return;
+          case 'kick':
+            await memberVoiceState.disconnect('Rejected from temp voice channel');
+            state.blocked.add(targetId);
+            await voiceChannel.permissionOverwrites.edit(targetId, { Connect: false });
+            await message.reply({ content: `<@${targetId}> has been rejected and cannot rejoin until unblocked.`, allowedMentions: { repliedUser: false } });
+            return;
+          case 'block':
+            state.blocked.add(targetId);
+            await voiceChannel.permissionOverwrites.edit(targetId, { Connect: false });
+            await message.reply({ content: `<@${targetId}> is blocked from joining.`, allowedMentions: { repliedUser: false } });
+            return;
+          case 'unblock':
+            state.blocked.delete(targetId);
+            await voiceChannel.permissionOverwrites.edit(targetId, {});
+            await message.reply({ content: `<@${targetId}> may now join again.`, allowedMentions: { repliedUser: false } });
+            return;
+          case 'transfer':
+            state.ownerId = targetId;
+            await message.reply({ content: `<@${targetId}> is now the owner.`, allowedMentions: { repliedUser: false } });
+            return;
+        }
+        return;
+      }
+      case 'claim': {
+        if (state.ownerId === member.id) {
+          await message.reply({ content: 'You already own this channel.', allowedMentions: { repliedUser: false } });
+          return;
+        }
+        const ownerMember = await message.guild.members.fetch(state.ownerId).catch(() => null);
+        if (ownerMember && voiceChannel.members.has(state.ownerId)) {
+          await message.reply({ content: 'The owner is still present in the channel.', allowedMentions: { repliedUser: false } });
+          return;
+        }
+        const previousOwner = state.ownerId;
+        state.ownerId = member.id;
+        if (voiceStatesByOwner.get(previousOwner) === state) {
+          voiceStatesByOwner.delete(previousOwner);
+        }
+        voiceStatesByOwner.set(state.ownerId, state);
+        await message.reply({ content: 'You are now the owner of this temp voice channel.', allowedMentions: { repliedUser: false } });
+        return;
+      }
+      case 'delete': {
+        if (!isOwner) {
+          await message.reply({ content: 'Only the owner can delete the channel.', allowedMentions: { repliedUser: false } });
+          return;
+        }
+        await cleanupTempVoiceChannel(voiceChannel.id);
+        await message.reply({ content: 'Voice channel deleted.', allowedMentions: { repliedUser: false } });
+        return;
+      }
+      case 'help': {
+        await message.reply({ content: 'Commands: `.v name <name>`, `.v limit <0-99>`, `.v region <region>`, `.v privacy`, `.v trust <@user>`, `.v untrust <@user>`, `.v kick <@user>`, `.v unblock <@user>`, `.v claim`, `.v transfer <@user>`, `.v delete`', allowedMentions: { repliedUser: false } });
+        return;
+      }
+      default: {
+        await message.reply({ content: 'Unknown .v command. Use `.v help` for the list.', allowedMentions: { repliedUser: false } });
+        return;
+      }
+    }
+  } catch (error) {
+    console.error('Message command handler error:', error);
+    await message.reply({ content: 'There was an error processing your command.', allowedMentions: { repliedUser: false } });
   }
 });
 
