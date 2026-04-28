@@ -478,49 +478,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.reply({ content: `You have been given the **${role.name}** role.`, flags: MessageFlags.Ephemeral });
         return;
       }
-
-<<<<<<< HEAD
-=======
-      // Auto-role buttons: toggle role by name
-      if (interaction.customId.startsWith(`${AUTO_ROLE_PREFIX}:`)) {
-        const roleName = interaction.customId.split(':').slice(1).join(':');
-        const guild = interaction.guild;
-        if (!guild) {
-          await interaction.reply({ content: 'This button can only be used in the server.', flags: MessageFlags.Ephemeral });
-          return;
-        }
-
-        const member = interaction.member || await guild.members.fetch(interaction.user.id).catch(() => null);
-        if (!member) {
-          await interaction.reply({ content: 'Could not resolve your member information.', flags: MessageFlags.Ephemeral });
-          return;
-        }
-
-        // Find role by exact name (case-insensitive fallback)
-        let role = guild.roles.cache.find(r => r.name === roleName);
-        if (!role) role = guild.roles.cache.find(r => r.name?.toLowerCase() === roleName.toLowerCase());
-        if (!role) {
-          await interaction.reply({ content: `Role **${roleName}** not found on this server.`, flags: MessageFlags.Ephemeral });
-          return;
-        }
-
-        try {
-          if (member.roles.cache.has(role.id)) {
-            await member.roles.remove(role, 'Self-removed via autorole button');
-            await interaction.reply({ content: `Removed **${role.name}** from you.`, flags: MessageFlags.Ephemeral });
-          } else {
-            await member.roles.add(role, 'Self-assigned via autorole button');
-            await interaction.reply({ content: `Assigned **${role.name}** to you.`, flags: MessageFlags.Ephemeral });
-          }
-        } catch (err) {
-          console.error('Autorole toggle error:', err);
-          await interaction.reply({ content: 'Failed to toggle that role. Check bot role permissions and hierarchy.', flags: MessageFlags.Ephemeral });
-        }
-
-        return;
-      }
-
->>>>>>> cecccb1 (Add autoroles panel and toggle handling)
       const [prefix, action, channelId] = interaction.customId.split(':');
       if (prefix !== CHANNEL_PREFIX) return;
 
@@ -1291,10 +1248,7 @@ client.once(Events.ClientReady, async () => {
   }
 
   await ensureVerificationMessage();
-<<<<<<< HEAD
-=======
   await ensureAutoRolesPanel();
->>>>>>> cecccb1 (Add autoroles panel and toggle handling)
 });
 
 client.login(token);
