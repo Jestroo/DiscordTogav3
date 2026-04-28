@@ -40,6 +40,39 @@ Deployment
 Security
 - Never commit `.env` or tokens to the repository. If a token is exposed, rotate it immediately and remove it from history.
 
+Containerized deployment (Docker)
+
+Build and run the bot with Docker:
+
+```bash
+# build image
+docker build -t discordtogav2:latest .
+
+# run (reads .env in project root)
+docker run --env-file .env --restart unless-stopped discordtogav2:latest
+```
+
+Or with `docker-compose`:
+
+```bash
+docker-compose up -d --build
+```
+
+PM2 (process manager) example
+
+Use the provided `ecosystem.config.js`:
+
+```bash
+# install pm2 globally if needed
+npm install -g pm2
+
+# start the app
+pm2 start ecosystem.config.js
+
+# save process list for restart on boot
+pm2 save
+```
+
 Contributing
 - Fork the repo, create a branch, and open a pull request. Keep changes scoped and document behavior.
 
