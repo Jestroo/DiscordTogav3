@@ -46,6 +46,8 @@ const CHANNEL_PREFIX = 'tempvoice';
 const LOBBY_CHANNEL_ID = '1497294929477505115';
 const VERIFICATION_CHANNEL_ID = '1497321024520454245';
 const VERIFY_BUTTON_ID = 'verify:button';
+const AUTO_ROLES_CHANNEL_ID = '1498080442987970681';
+const AUTO_ROLE_PREFIX = 'autorole';
 
 async function getLobbyChannel() {
   return client.channels.fetch(LOBBY_CHANNEL_ID).catch(() => null);
@@ -96,6 +98,40 @@ async function ensureVerificationMessage() {
   await channel.send({ embeds: [verifyEmbed], components: [row] });
 }
 
+async function ensureAutoRolesPanel() {
+  const channel = await client.channels.fetch(AUTO_ROLES_CHANNEL_ID).catch(() => null);
+  if (!channel || !channel.isTextBased()) return;
+
+  const messages = await channel.messages.fetch({ limit: 50 });
+  const existing = messages.find(message =>
+    message.author.id === client.user.id &&
+    message.components.some(row => row.components.some(component => component.customId && component.customId.startsWith(`${AUTO_ROLE_PREFIX}:`)))
+  );
+
+  if (existing) return;
+
+  const embed = new EmbedBuilder()
+    .setTitle('Game Roles')
+    .setDescription('Click a button to toggle your self-assignable game role.')
+    .addFields(
+      { name: 'Available roles', value: 'Valorant, GTA V, Among Us, FIFA, LoL' },
+      { name: 'Instructions', value: 'Click a role button to add or remove that role from yourself.' }
+    )
+    .setColor(0x5865f2);
+
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`${AUTO_ROLE_PREFIX}:Valorant`).setLabel('Valorant').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`${AUTO_ROLE_PREFIX}:GTA V`).setLabel('GTA V').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`${AUTO_ROLE_PREFIX}:Among Us`).setLabel('Among Us').setStyle(ButtonStyle.Primary)
+  );
+
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`${AUTO_ROLE_PREFIX}:FIFA`).setLabel('FIFA').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`${AUTO_ROLE_PREFIX}:LoL`).setLabel('LoL').setStyle(ButtonStyle.Primary)
+  );
+
+  await channel.send({ embeds: [embed], components: [row1, row2] });
+}
 async function createTempVoiceForMember(member, lobbyChannel) {
   const guild = member.guild;
   const channelName = `${member.displayName} voice`;
@@ -443,6 +479,48 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
+<<<<<<< HEAD
+=======
+      // Auto-role buttons: toggle role by name
+      if (interaction.customId.startsWith(`${AUTO_ROLE_PREFIX}:`)) {
+        const roleName = interaction.customId.split(':').slice(1).join(':');
+        const guild = interaction.guild;
+        if (!guild) {
+          await interaction.reply({ content: 'This button can only be used in the server.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        const member = interaction.member || await guild.members.fetch(interaction.user.id).catch(() => null);
+        if (!member) {
+          await interaction.reply({ content: 'Could not resolve your member information.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        // Find role by exact name (case-insensitive fallback)
+        let role = guild.roles.cache.find(r => r.name === roleName);
+        if (!role) role = guild.roles.cache.find(r => r.name?.toLowerCase() === roleName.toLowerCase());
+        if (!role) {
+          await interaction.reply({ content: `Role **${roleName}** not found on this server.`, flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        try {
+          if (member.roles.cache.has(role.id)) {
+            await member.roles.remove(role, 'Self-removed via autorole button');
+            await interaction.reply({ content: `Removed **${role.name}** from you.`, flags: MessageFlags.Ephemeral });
+          } else {
+            await member.roles.add(role, 'Self-assigned via autorole button');
+            await interaction.reply({ content: `Assigned **${role.name}** to you.`, flags: MessageFlags.Ephemeral });
+          }
+        } catch (err) {
+          console.error('Autorole toggle error:', err);
+          await interaction.reply({ content: 'Failed to toggle that role. Check bot role permissions and hierarchy.', flags: MessageFlags.Ephemeral });
+        }
+
+        return;
+      }
+
+>>>>>>> cecccb1 (Add autoroles panel and toggle handling)
       const [prefix, action, channelId] = interaction.customId.split(':');
       if (prefix !== CHANNEL_PREFIX) return;
 
@@ -1213,6 +1291,10 @@ client.once(Events.ClientReady, async () => {
   }
 
   await ensureVerificationMessage();
+<<<<<<< HEAD
+=======
+  await ensureAutoRolesPanel();
+>>>>>>> cecccb1 (Add autoroles panel and toggle handling)
 });
 
 client.login(token);
