@@ -46,8 +46,21 @@ const CHANNEL_PREFIX = 'tempvoice';
 const LOBBY_CHANNEL_ID = '1497294929477505115';
 const VERIFICATION_CHANNEL_ID = '1497321024520454245';
 const VERIFY_BUTTON_ID = 'verify:button';
-const AUTO_ROLES_CHANNEL_ID = '1498080442987970681';
-const AUTO_ROLE_PREFIX = 'autorole';
+// (autoroles removed - only verification panel is used)
+const ANNOUNCEMENTS_CHANNEL_ID = '1498645722067763280';
+const ANNOUNCEMENTS_PREFIX = 'announcements';
+
+const TIPS = [
+  'Be respectful: treat others how you want to be treated.',
+  'Use meaningful channel names to keep conversations organized.',
+  'Keep roles lean — fewer roles means easier management.',
+  'Pin important messages so members can find them later.',
+  'Set clear rules and enforce them consistently.'
+];
+
+function getRandomTip() {
+  return TIPS[Math.floor(Math.random() * TIPS.length)];
+}
 
 async function getLobbyChannel() {
   return client.channels.fetch(LOBBY_CHANNEL_ID).catch(() => null);
@@ -98,39 +111,36 @@ async function ensureVerificationMessage() {
   await channel.send({ embeds: [verifyEmbed], components: [row] });
 }
 
-async function ensureAutoRolesPanel() {
-  const channel = await client.channels.fetch(AUTO_ROLES_CHANNEL_ID).catch(() => null);
+// autorole panel removed; only verification panel is used
+
+function buildAnnouncementEmbed(tip) {
+  return new EmbedBuilder()
+    .setTitle('Server Announcements')
+    .setDescription('Welcome to the announcement channel! Here is the latest community update from your bot.')
+    .addFields(
+      { name: 'Tip of the Day', value: tip || 'Stay tuned for daily tips!', inline: false }
+    )
+    .setColor(0x57f287)
+    .setTimestamp();
+}
+
+async function ensureAnnouncementsPanel() {
+  const channel = await client.channels.fetch(ANNOUNCEMENTS_CHANNEL_ID).catch(() => null);
   if (!channel || !channel.isTextBased()) return;
 
   const messages = await channel.messages.fetch({ limit: 50 });
-  const existing = messages.find(message =>
-    message.author.id === client.user.id &&
-    message.components.some(row => row.components.some(component => component.customId && component.customId.startsWith(`${AUTO_ROLE_PREFIX}:`)))
+  const existing = messages.find(msg =>
+    msg.author.id === client.user.id && msg.embeds.some(e => e.title === 'Server Announcements')
   );
 
   if (existing) return;
 
-  const embed = new EmbedBuilder()
-    .setTitle('Game Roles')
-    .setDescription('Click a button to toggle your self-assignable game role.')
-    .addFields(
-      { name: 'Available roles', value: 'Valorant, GTA V, Among Us, FIFA, LoL' },
-      { name: 'Instructions', value: 'Click a role button to add or remove that role from yourself.' }
-    )
-    .setColor(0x5865f2);
-
-  const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`${AUTO_ROLE_PREFIX}:Valorant`).setLabel('Valorant').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`${AUTO_ROLE_PREFIX}:GTA V`).setLabel('GTA V').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`${AUTO_ROLE_PREFIX}:Among Us`).setLabel('Among Us').setStyle(ButtonStyle.Primary)
+  const embed = buildAnnouncementEmbed(getRandomTip());
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`${ANNOUNCEMENTS_PREFIX}:refresh`).setLabel('Refresh Tip').setStyle(ButtonStyle.Secondary)
   );
 
-  const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`${AUTO_ROLE_PREFIX}:FIFA`).setLabel('FIFA').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`${AUTO_ROLE_PREFIX}:LoL`).setLabel('LoL').setStyle(ButtonStyle.Primary)
-  );
-
-  await channel.send({ embeds: [embed], components: [row1, row2] });
+  await channel.send({ embeds: [embed], components: [row] });
 }
 async function createTempVoiceForMember(member, lobbyChannel) {
   const guild = member.guild;
@@ -476,6 +486,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         await interaction.reply({ content: `You have been given the **${role.name}** role.`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      // Announcements refresh button
+      if (interaction.customId && interaction.customId.startsWith(`${ANNOUNCEMENTS_PREFIX}:`)) {
+        const [, action] = interaction.customId.split(':');
+        if (action === 'refresh') {
+          try {
+            const tip = getRandomTip();
+            const newEmbed = buildAnnouncementEmbed(tip);
+            if (interaction.message) {
+              await interaction.message.edit({ embeds: [newEmbed], components: interaction.message.components });
+            }
+            await interaction.reply({ content: 'Tip refreshed.', flags: MessageFlags.Ephemeral });
+          } catch (err) {
+            await interaction.reply({ content: 'Failed to refresh tip.', flags: MessageFlags.Ephemeral });
+          }
+        }
         return;
       }
       const [prefix, action, channelId] = interaction.customId.split(':');
@@ -1248,7 +1275,45 @@ client.once(Events.ClientReady, async () => {
   }
 
   await ensureVerificationMessage();
-  await ensureAutoRolesPanel();
+  await ensureAnnouncementsPanel();
+  await scheduleDailyTipRotation();
 });
+
+async function rotateAnnouncementTip() {
+  const channel = await client.channels.fetch(ANNOUNCEMENTS_CHANNEL_ID).catch(() => null);
+  if (!channel || !channel.isTextBased()) return;
+
+  const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+  let msg = messages && messages.find(m => m.author?.id === client.user.id && m.embeds.some(e => e.title === 'Server Announcements'));
+  if (!msg) {
+    await ensureAnnouncementsPanel();
+    const refreshed = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+    msg = refreshed && refreshed.find(m => m.author?.id === client.user.id && m.embeds.some(e => e.title === 'Server Announcements'));
+  }
+  if (!msg) return;
+
+  const tip = getRandomTip();
+  const newEmbed = buildAnnouncementEmbed(tip);
+  try {
+    await msg.edit({ embeds: [newEmbed], components: msg.components });
+  } catch (err) {
+    console.warn('Failed to rotate announcement tip:', err.message);
+  }
+}
+
+async function scheduleDailyTipRotation() {
+  // rotate now once to ensure freshness
+  await rotateAnnouncementTip().catch(() => null);
+
+  const now = new Date();
+  const next = new Date(now);
+  next.setHours(24, 0, 5, 0); // next local midnight plus 5s buffer
+  const delay = Math.max(0, next.getTime() - now.getTime());
+
+  setTimeout(() => {
+    rotateAnnouncementTip().catch(() => null);
+    setInterval(() => rotateAnnouncementTip().catch(() => null), 24 * 60 * 60 * 1000);
+  }, delay);
+}
 
 client.login(token);
